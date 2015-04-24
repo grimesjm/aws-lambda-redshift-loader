@@ -35,6 +35,7 @@ var kmsCrypto = require('./kmsCrypto');
 var common = require('./common');
 var async = require('async');
 var uuid = require('node-uuid');
+var path = require('path')
 
 // main function for AWS Lambda
 exports.handler = function(event, context) {
@@ -409,7 +410,7 @@ exports.handler = function(event, context) {
 					var updateCurrentBatchStatus = {
 						Key : {
 							batchId : {
-								S : thisBatchId,
+								S : thisBatchId
 							},
 							s3Prefix : {
 								S : s3Info.prefix
@@ -582,7 +583,7 @@ exports.handler = function(event, context) {
 									console.log(err);
 									context.done(error, err);
 								} else {
-									copyCommand = copyCommand + 'begin;\nCOPY ' + config.targetTable.S + ' from \'s3://'
+									copyCommand = copyCommand + 'begin;\nCOPY ' + path.basename(s3Info.prefix) + ' from \'s3://'
 											+ manifestInfo.manifestPath + '\' with credentials as \'aws_access_key_id='
 											+ config.accessKeyForS3.S + ';aws_secret_access_key=' + decryptedConfigItems[0].toString()
 											+ '\' manifest ';
@@ -616,7 +617,7 @@ exports.handler = function(event, context) {
 									// build the connection string
 									var dbString = '';
 									if (config.clusterDB) {
-										dbString = '/' + config.clusterDB.S;
+										dbString = '/' + s3Info.prefix.split(path.sep)[0];
 									}
 									var clusterString = 'jdbc:postgresql://' + config.clusterEndpoint.S + ':' + config.clusterPort.N
 											+ dbString + '?tcpKeepAlive=true';
