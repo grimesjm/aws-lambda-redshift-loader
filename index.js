@@ -45,7 +45,7 @@ exports.handler = function(event, context) {
 	var foundConfig = function(s3Info, err, data) {
 		if (err) {
 			console.log(err);
-			var msg = 'Error getting Redshift Configuration for ' + s3Info.prefix + ' from Dynamo DB ';
+			var msg = 'Error getting Redshift Configuration for ' + s3Info.dynamoLookup + ' from Dynamo DB ';
 			console.log(msg);
 			context.done(error, msg);
 		}
@@ -53,11 +53,11 @@ exports.handler = function(event, context) {
 		if (!data || !data.Item) {
 			// finish with no exception - where this file sits in the S3
 			// structure is not configured for redshift loads
-			console.log("unable to load configuration for " + s3Info.prefix);
+			console.log("unable to load configuration for " + s3Info.dynamoLookup);
 
 			context.done(null, null);
 		} else {
-			console.log("Found Redshift Load Configuration for " + s3Info.prefix);
+			console.log("Found Redshift Load Configuration for " + s3Info.dynamoLookup);
 
 			var config = data.Item;
 			var thisBatchId = config.currentBatch.S;
@@ -191,7 +191,7 @@ exports.handler = function(event, context) {
 										var configReloadRequest = {
 											Key : {
 												s3Prefix : {
-													S : s3Info.prefix
+													S : s3Info.dynamoLookup
 												}
 											},
 											TableName : configTable,
@@ -583,11 +583,11 @@ exports.handler = function(event, context) {
 									console.log(err);
 									context.done(error, err);
 								} else {
-									copyCommand = copyCommand + 'begin;\nCOPY ' + path.basename(s3Info.prefix) + ' from \'s3://'
+									copyCommand = copyCommand + 'begin;\nCOPY ' + path.basename(s3Info.bucket + '/' + s3Info.key,".csv") + ' from \'s3://'
 											+ manifestInfo.manifestPath + '\' with credentials as \'aws_access_key_id='
 											+ config.accessKeyForS3.S + ';aws_secret_access_key=' + decryptedConfigItems[0].toString()
 											+ '\' manifest ';
-
+									console.log(copyCommand);
 									// add data formatting directives
 									if (config.dataFormat.S === 'CSV') {
 										copyCommand = copyCommand + ' delimiter \'' + config.csvDelimiter.S + '\'\n';
@@ -617,7 +617,7 @@ exports.handler = function(event, context) {
 									// build the connection string
 									var dbString = '';
 									if (config.clusterDB) {
-										dbString = '/' + s3Info.prefix.split(path.sep)[0];
+										dbString = '/' + s3Info.prefix.split(path.sep)[1];
 									}
 									var clusterString = 'jdbc:postgresql://' + config.clusterEndpoint.S + ':' + config.clusterPort.N
 											+ dbString + '?tcpKeepAlive=true';
@@ -896,7 +896,8 @@ exports.handler = function(event, context) {
 					bucket : undefined,
 					key : undefined,
 					prefix : undefined,
-					inputFilename : undefined
+					inputFilename : undefined,
+					dynamoLookup : undefined
 				};
 
 				inputInfo.bucket = r.s3.bucket.name;
@@ -923,13 +924,13 @@ exports.handler = function(event, context) {
 					searchKey = "/" + searchKey;
 				}
 				inputInfo.prefix = inputInfo.bucket + searchKey;
-
+				inputInfo.dynamoLookup = inputInfo.bucket + "/" + keyComponents[0]; //the site		
 				// load the configuration for this prefix, which will kick off
 				// the callback chain
 				var dynamoLookup = {
 					Key : {
 						s3Prefix : {
-							S : inputInfo.prefix
+							S : inputInfo.dynamoLookup
 						}
 					},
 					TableName : configTable,
