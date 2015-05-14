@@ -116,7 +116,7 @@ exports.handler =
 			 * success callback
 			 */
 			exports.checkFileProcessed = function(config, thisBatchId, s3Info) {
-				var itemEntry = s3Info.bucket + '/' + s3Info.key;
+				var itemEntry =s3Info.fullPath;
 
 				// perform the idempotency check for the file before we put it
 				// into
@@ -191,7 +191,7 @@ exports.handler =
 														S : thisBatchId
 													},
 													s3Prefix : {
-														S : s3Info.prefix
+														S : s3Info.fullPath
 													}
 												},
 												TableName : batchTable,
@@ -412,7 +412,7 @@ exports.handler =
 									S : thisBatchId
 								},
 								s3Prefix : {
-									S : s3Info.prefix
+									S : s3Info.fullPath
 								}
 							},
 							TableName : batchTable,
@@ -456,7 +456,7 @@ exports.handler =
 														S : thisBatchId
 													},
 													s3Prefix : {
-														S : s3Info.prefix
+														S : s3Info.fullPath
 													}
 												},
 												TableName : batchTable,
@@ -522,7 +522,7 @@ exports.handler =
 														var allocateNewBatchRequest = {
 															Key : {
 																s3Prefix : {
-																	S : s3Info.prefix
+																	S : s3Info.fullPath
 																}
 															},
 															TableName : configTable,
@@ -584,7 +584,7 @@ exports.handler =
 								 * from Lambda with '+' and plus values come in as %2B. Redshift
 								 * wants the original S3 value
 								 */
-								url : 's3://' + batchEntries[i].replace('+', ' ').replace('%2B', '+'),
+								url : 's3://' + r.s3.bucket.name + "/" +  batchEntries[i].replace('+', ' ').replace('%2B', '+'),
 								mandatory : true
 							});
 						}
@@ -664,7 +664,7 @@ exports.handler =
 									S : thisBatchId
 								},
 								s3Prefix : {
-									S : s3Info.prefix
+									S : s3Info.fullPath
 								}
 							},
 							TableName : batchTable,
@@ -727,11 +727,12 @@ exports.handler =
 									cluster : clusterInfo.clusterEndpoint.S
 								});
 							} else {
-								copyCommand = copyCommand + 'begin;\nCOPY ' + path.basename(s3Info.bucket + '/' + s3Info.key,".csv") + ' from \'s3://'
+								console.log("Full Path: " + s3Info.fullPath);
+								copyCommand = copyCommand + 'begin;\nCOPY ' + path.basename(s3Info.fullPath,".csv") + ' from \'s3://'
 								+ manifestInfo.manifestPath + '\' with credentials as \'aws_access_key_id='
 								+ config.accessKeyForS3.S + ';aws_secret_access_key=' + decryptedConfigItems[0].toString()
 								+ '\' manifest ';
-								console.log(copyCommand);
+
 								// add data formatting directives
 								if (config.dataFormat.S === 'CSV') {
 									copyCommand = copyCommand + ' delimiter \'' + config.csvDelimiter.S + '\'\n';
@@ -760,7 +761,7 @@ exports.handler =
 								}
 
 								copyCommand = copyCommand + ";\ncommit;";
-
+								console.log(copyCommand);
 								// build the connection string
 								var dbString =
 										'postgres://' + clusterInfo.connectUser.S + ":" + decryptedConfigItems[1].toString() + "@"
@@ -900,7 +901,7 @@ exports.handler =
 							S : thisBatchId
 						},
 						s3Prefix : {
-							S : s3Info.prefix
+							S : s3Info.fullPath
 						}
 					},
 					TableName : batchTable,
@@ -976,7 +977,7 @@ exports.handler =
 							error : errorMessage,
 							status : statusMessage,
 							batchId : thisBatchId,
-							s3Prefix : s3Info.prefix
+							s3Prefix : s3Info.fullPath
 						};
 
 						if (manifestInfo) {
@@ -1031,7 +1032,7 @@ exports.handler =
 				} else {
 					for (var i = 0; i < event.Records.length; i++) {
 						var r = event.Records[i];
-
+						console.log(r.s3.object);
 						// ensure that we can process this event based on a variety
 						// of criteria
 						var noProcessReason = undefined;
@@ -1084,6 +1085,8 @@ exports.handler =
 								searchKey = "/" + searchKey;
 							}
 							inputInfo.prefix = inputInfo.bucket + searchKey;
+							inputInfo.fullPath = r.s3.object.key;
+
 							inputInfo.dynamoLookup = inputInfo.bucket + "/" + keyComponents[0]; //the site		
 							// load the configuration for this prefix, which will kick off
 							// the callback chain
