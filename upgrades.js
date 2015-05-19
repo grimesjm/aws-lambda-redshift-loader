@@ -33,7 +33,7 @@ exports.v1_v2 = function(err, s3Info, configPre, forwardCallback) {
 	var updateRequest = {
 		Key : {
 			s3Prefix : {
-				S : s3Info.prefix
+				S : s3Info.dynamoLookup
 			}
 		},
 		TableName : configTable,
@@ -72,7 +72,7 @@ exports.v1_v2 = function(err, s3Info, configPre, forwardCallback) {
 				var dynamoLookup = {
 					Key : {
 						s3Prefix : {
-							S : s3Info.prefix
+							S : s3Info.dynamoLookup
 						}
 					},
 					TableName : configTable,

@@ -45,7 +45,15 @@ var path = require('path');
 exports.handler =
 		function(event, context) {
 			/** runtime functions * */
-
+			exports.upgradeConfig = function(s3Info, currentConfig, callback) {
+				// v 1.x to 2.x upgrade for multi-cluster loaders
+				if (currentConfig.version !== pjson.version) {
+					upgrade.upgradeAll(dynamoDB, s3Info, currentConfig, callback);
+				} else {
+					// no upgrade needed
+					callback(null, s3Info, currentConfig);
+				}
+			};
 
 			/* callback run when we find a configuration for load in Dynamo DB */
 			exports.foundConfig =
@@ -67,8 +75,18 @@ exports.handler =
 						} else {
 							console.log("Found Redshift Load Configuration for " + s3Info.dynamoLookup);
 							var config = data.Item;
-							var thisBatchId = config.currentBatch.S;
-							exports.createManifest(config, thisBatchId, s3Info, s3Info);
+
+							exports.upgradeConfig(s3Info, config, function(err, s3Info, config) {
+								if (err) {
+									console.log(err);
+									context.done(error, err);
+								}else{
+									var thisBatchId = config.currentBatch.S;
+									exports.createManifest(config, thisBatchId, s3Info, s3Info);
+								}
+
+							});
+
 						}
 					};
 
@@ -110,14 +128,15 @@ exports.handler =
 						 * command in the callback letting us know that the manifest was
 						 * created correctly
 						 */
-						s3.putObject(s3PutParams, exports.loadRedshiftWithManifest.bind(undefined, config, thisBatchId, s3Info,
+						s3.putObject(s3PutParams, exports.loadRedshiftWithManifest.bind(undefined,config, thisBatchId, s3Info,
 								manifestInfo));
 					};
 
 			/**
 			 * Function run when the Redshift manifest write completes succesfully
 			 */
-			exports.loadRedshiftWithManifest = function(config, thisBatchId, s3Info, manifestInfo, err, data) {
+			exports.loadRedshiftWithManifest = function(config, thisBatchId, s3Info, manifestInfo, err) {
+				console.log("config: " + config);
 				if (err) {
 					console.log("Error on Manifest Creation");
 					console.log(err);
