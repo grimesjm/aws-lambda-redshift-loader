@@ -46,19 +46,6 @@ exports.handler =
 		function(event, context) {
 			/** runtime functions * */
 
-			/*
-			 * Function which performs all version upgrades over time - must be able
-			 * to do a forward migration from any version to 'current' at all times!
-			 */
-			exports.upgradeConfig = function(s3Info, currentConfig, callback) {
-				// v 1.x to 2.x upgrade for multi-cluster loaders
-				if (currentConfig.version !== pjson.version) {
-					upgrade.upgradeAll(dynamoDB, s3Info, currentConfig, callback);
-				} else {
-					// no upgrade needed
-					callback(null, s3Info, currentConfig);
-				}
-			};
 
 			/* callback run when we find a configuration for load in Dynamo DB */
 			exports.foundConfig =
@@ -79,495 +66,19 @@ exports.handler =
 							context.done(null, null);
 						} else {
 							console.log("Found Redshift Load Configuration for " + s3Info.dynamoLookup);
-
 							var config = data.Item;
 							var thisBatchId = config.currentBatch.S;
-
-							// run all configuration upgrades required
-							exports.upgradeConfig(s3Info, config, function(err, s3Info, config) {
-								if (err) {
-									console.log(err);
-									context.done(error, err);
-								} else {
-									if (config.filenameFilterRegex) {
-										if (s3Info.key.match(config.filenameFilterRegex.S)) {
-											exports.checkFileProcessed(config, thisBatchId, s3Info);
-										} else {
-											console.log('Object ' + s3Info.key + ' excluded by filename filter \''
-													+ config.filenameFilterRegex.S + '\'');
-
-											// scan the current batch to decide
-											// if it needs to
-											// be
-											// flushed due to batch timeout
-											exports.processPendingBatch(config, thisBatchId, s3Info);
-										}
-									} else {
-										// no filter, so we'll load the data
-										exports.checkFileProcessed(config, thisBatchId, s3Info);
-									}
-								}
-							});
+							exports.createManifest(config, thisBatchId, s3Info, s3Info);
 						}
 					};
 
-			/*
-			 * function to add a file to the pending batch set and then call the
-			 * success callback
-			 */
-			exports.checkFileProcessed = function(config, thisBatchId, s3Info) {
-				var itemEntry =s3Info.fullPath;
 
-				// perform the idempotency check for the file before we put it
-				// into
-				// a manifest
-				var fileEntry = {
-					Item : {
-						loadFile : {
-							S : itemEntry
-						}
-					},
-					Expected : {
-						loadFile : {
-							Exists : false
-						}
-					},
-					TableName : filesTable
-				};
-
-				// add the file to the processed list
-				dynamoDB.putItem(fileEntry, function(err, data) {
-					if (err) {
-						// the conditional check failed so the file has already
-						// been
-						// processed
-						console.log("File " + itemEntry + " Already Processed");
-						context.done(null, null);
-					} else {
-						if (!data) {
-							var msg = "Idempotency Check on " + fileEntry + " failed";
-							console.log(msg);
-							exports.failBatch(msg, config, thisBatchId, s3Info, undefined);
-						} else {
-							// add was OK - proceed with adding the entry to the
-							// pending batch
-							exports.addFileToPendingBatch(config, thisBatchId, s3Info, itemEntry);
-						}
-					}
-				});
-			};
-
-			/**
-			 * Function run to add a file to the existing open batch. This will
-			 * repeatedly try to write and if unsuccessful it will requery the batch
-			 * ID on the configuration
-			 */
-			exports.addFileToPendingBatch =
-					function(config, thisBatchId, s3Info, itemEntry) {
-						console.log("Adding Pending Batch Entry for " + itemEntry);
-
-						var proceed = false;
-						var asyncError = undefined;
-						var addFileRetryLimit = 100;
-						var tryNumber = 0;
-
-						async
-								.whilst(
-										function() {
-											// return OK if the proceed flag has
-											// been set, or if we've hit the
-											// retry count
-											return !proceed && tryNumber < addFileRetryLimit;
-										},
-										function(callback) {
-											tryNumber++;
-
-											// build the reference to the
-											// pending batch, with an
-											// atomic add of the current file
-											var item = {
-												Key : {
-													batchId : {
-														S : thisBatchId
-													},
-													s3Prefix : {
-														S : s3Info.fullPath
-													}
-												},
-												TableName : batchTable,
-												UpdateExpression : "add entries :entry set #stat = :open, lastUpdate = :updateTime",
-												ExpressionAttributeNames : {
-													"#stat" : 'status'
-												},
-												ExpressionAttributeValues : {
-													":entry" : {
-														SS : [ itemEntry ]
-													},
-													":updateTime" : {
-														N : '' + common.now()
-													},
-													":open" : {
-														S : open
-													}
-												},
-												/*
-												 * current batch can't be locked
-												 */
-												ConditionExpression : "#stat = :open or attribute_not_exists(#stat)"
-											};
-
-											// add the file to the pending batch
-											dynamoDB.updateItem(item, function(err, data) {
-												if (err) {
-													if (err.code === conditionCheckFailed) {
-														/*
-														 * the batch I have a reference to was locked so
-														 * reload the current batch ID from the config
-														 */
-														var configReloadRequest = {
-															Key : {
-																s3Prefix : {
-																	S : s3Info.dynamoLookup
-																}
-															},
-															TableName : configTable,
-															ConsistentRead : true
-														};
-														dynamoDB.getItem(configReloadRequest, function(err, data) {
-															if (err) {
-																console.log(err);
-																callback(err);
-															} else {
-																/*
-																 * reset the batch ID to the current marked
-																 * batch
-																 */
-																thisBatchId = data.Item.currentBatch.S;
-
-																/*
-																 * we've not set proceed to true, so async will
-																 * retry
-																 */
-																console.log("Reload of Configuration Complete after attempting Locked Batch Write");
-
-																/*
-																 * we can call into the callback immediately, as
-																 * we probably just missed the pending batch
-																 * processor's rotate of the configuration batch
-																 * ID
-																 */
-																callback();
-															}
-														});
-													} else {
-														asyncError = err;
-														proceed = true;
-														callback();
-													}
-												} else {
-													/*
-													 * no error - the file was added to the batch, so mark
-													 * the operation as OK so async will not retry
-													 */
-													proceed = true;
-													callback();
-												}
-											});
-										},
-										function(err) {
-											if (err) {
-												// throw presented errors
-												console.log(err);
-												context.done(error, err);
-											} else {
-												if (asyncError) {
-													/*
-													 * throw errors which were encountered during the
-													 * async calls
-													 */
-													console.log(asyncError);
-													context.done(error, asyncError);
-												} else {
-													if (!proceed) {
-														/*
-														 * process what happened if the iterative request to
-														 * write to the open pending batch timed out
-														 * 
-														 * TODO Can we force a rotation of the current batch
-														 * at this point?
-														 */
-														var e =
-																"Unable to write "
-																		+ itemEntry
-																		+ " in "
-																		+ addFileRetryLimit
-																		+ " attempts. Failing further processing to Batch "
-																		+ thisBatchId
-																		+ " which may be stuck in '"
-																		+ locked
-																		+ "' state. If so, unlock the back using `node unlockBatch.js <batch ID>`, delete the processed file marker with `node processedFiles.js -d <filename>`, and then re-store the file in S3";
-														console.log(e);
-														exports.sendSNS(config.failureTopicARN.S,
-																"Lambda Redshift Loader unable to write to Open Pending Batch", e, function() {
-																	context.done(error, e);
-																}, function(err) {
-																	console.log(err);
-																	context.done(error, "Unable to Send SNS Notification");
-																});
-													} else {
-														// the add of the file was successful, so we
-														exports.linkProcessedFileToBatch(itemEntry, thisBatchId);
-														// which is async, so may fail but we'll still sweep
-														// the pending batch
-														exports.processPendingBatch(config, thisBatchId, s3Info);
-													}
-												}
-											}
-										});
-					};
-
-			/**
-			 * Function which will link the deduplication table entry for the file to
-			 * the batch into which the file was finally added
-			 */
-			exports.linkProcessedFileToBatch = function(itemEntry, batchId) {
-				var updateProcessedFile = {
-					Key : {
-						loadFile : {
-							S : itemEntry
-						}
-					},
-					TableName : filesTable,
-					AttributeUpdates : {
-						batchId : {
-							Action : 'PUT',
-							Value : {
-								S : batchId
-							}
-						}
-					}
-				};
-				dynamoDB.updateItem(updateProcessedFile, function(err, data) {
-					// because this is an async call which doesn't affect
-					// process flow, we'll just log the error and do nothing with the OK
-					// response
-					if (err) {
-						console.log(err);
-					}
-				});
-			};
-
-			/**
-			 * Function which links the manifest name used to load redshift onto the
-			 * batch table entry
-			 */
-			exports.addManifestToBatch = function(config, thisBatchId, s3Info, manifestInfo) {
-				// build the reference to the pending batch, with an atomic
-				// add of the current file
-				var item = {
-					Key : {
-						batchId : {
-							S : thisBatchId
-						},
-						s3Prefix : {
-							S : s3Info.prefix
-						}
-					},
-					TableName : batchTable,
-					AttributeUpdates : {
-						manifestFile : {
-							Action : 'PUT',
-							Value : {
-								S : manifestInfo.manifestPath
-							}
-						},
-						lastUpdate : {
-							Action : 'PUT',
-							Value : {
-								N : '' + common.now()
-							}
-						}
-					}
-				};
-
-				dynamoDB.updateItem(item, function(err, data) {
-					if (err) {
-						console.log(err);
-					} else {
-						console.log("Linked Manifest " + manifestInfo.manifestName + " to Batch " + thisBatchId);
-					}
-				});
-			};
-
-			/**
-			 * Function to process the current pending batch, and create a batch load
-			 * process if required on the basis of size or timeout
-			 */
-			exports.processPendingBatch =
-					function(config, thisBatchId, s3Info) {
-						// make the request for the current batch
-						var currentBatchRequest = {
-							Key : {
-								batchId : {
-									S : thisBatchId
-								},
-								s3Prefix : {
-									S : s3Info.fullPath
-								}
-							},
-							TableName : batchTable,
-							ConsistentRead : true
-						};
-
-						dynamoDB.getItem(currentBatchRequest,
-								function(err, data) {
-									if (err) {
-										console.log(err);
-										context.done(error, err);
-									} else if (!data || !data.Item) {
-										var msg = "No open pending Batch " + thisBatchId;
-										console.log(msg);
-										context.done(null, msg);
-									} else {
-										// check whether the current batch is bigger than the
-										// configured max size, or older than configured max age
-										var lastUpdateTime = data.Item.lastUpdate.N;
-										var pendingEntries = data.Item.entries.SS;
-										var doProcessBatch = false;
-										if (pendingEntries.length >= parseInt(config.batchSize.N)) {
-											console.log("Batch Size " + config.batchSize.N + " reached");
-											doProcessBatch = true;
-										}
-
-										if (config.batchTimeoutSecs && config.batchTimeoutSecs.N) {
-											if (common.now() - lastUpdateTime > parseInt(config.batchTimeoutSecs.N)
-													&& pendingEntries.length > 0) {
-												console.log("Batch Size " + config.batchSize.N + " not reached but reached Age "
-														+ config.batchTimeoutSecs.N + " seconds");
-												doProcessBatch = true;
-											}
-										}
-
-										if (doProcessBatch) {
-											// set the current batch to locked status
-											var updateCurrentBatchStatus = {
-												Key : {
-													batchId : {
-														S : thisBatchId
-													},
-													s3Prefix : {
-														S : s3Info.fullPath
-													}
-												},
-												TableName : batchTable,
-												AttributeUpdates : {
-													status : {
-														Action : 'PUT',
-														Value : {
-															S : locked
-														}
-													},
-													lastUpdate : {
-														Action : 'PUT',
-														Value : {
-															N : '' + common.now()
-														}
-													}
-												},
-												/*
-												 * the batch to be processed has to be 'open', otherwise
-												 * we'll have multiple processes all handling a single
-												 * batch
-												 */
-												Expected : {
-													status : {
-														AttributeValueList : [ {
-															S : open
-														} ],
-														ComparisonOperator : 'EQ'
-													}
-												},
-												/*
-												 * add the ALL_NEW return values so we have the most up
-												 * to date version of the entries string set
-												 */
-												ReturnValues : "ALL_NEW"
-											};
-											dynamoDB.updateItem(updateCurrentBatchStatus, function(err, data) {
-												if (err) {
-													if (err.code === conditionCheckFailed) {
-														/*
-														 * some other Lambda function has locked the batch -
-														 * this is OK and we'll just exit quietly
-														 */
-														context.done(null, null);
-													} else {
-														console.log("Unable to lock Batch " + thisBatchId);
-														context.done(error, err);
-													}
-												} else {
-													if (!data.Attributes) {
-														var e = "Unable to extract latest pending entries set from Locked batch";
-														console.log(e);
-														context.done(error, e);
-													} else {
-														/*
-														 * grab the pending entries from the locked batch
-														 */
-														pendingEntries = data.Attributes.entries.SS;
-
-														/*
-														 * assign the loaded configuration a new batch ID
-														 */
-														var allocateNewBatchRequest = {
-															Key : {
-																s3Prefix : {
-																	S : s3Info.fullPath
-																}
-															},
-															TableName : configTable,
-															AttributeUpdates : {
-																currentBatch : {
-																	Action : 'PUT',
-																	Value : {
-																		S : uuid.v4()
-																	}
-																},
-																lastBatchRotation : {
-																	Action : 'PUT',
-																	Value : {
-																		N : '' + common.now()
-																	}
-																}
-															}
-														};
-
-														dynamoDB.updateItem(allocateNewBatchRequest, function(err, data) {
-															if (err) {
-																console.log("Error while allocating new Pending Batch ID");
-																console.log(err);
-																context.done(error, err);
-															} else {
-																// OK - let's create the manifest file
-																exports.createManifest(config, thisBatchId, s3Info, pendingEntries);
-															}
-														});
-													}
-												}
-											});
-										} else {
-											console.log("No pending batch flush required");
-											context.done(null, null);
-										}
-									}
-								});
-					};
 
 			/**
 			 * Function which will create the manifest for a given batch and entries
 			 */
 			exports.createManifest =
-					function(config, thisBatchId, s3Info, batchEntries) {
+					function(config, thisBatchId, s3Info, batchEntry) {
 						console.log("Creating Manifest for Batch " + thisBatchId);
 
 						var manifestInfo = common.createManifestInfo(config);
@@ -577,17 +88,15 @@ exports.handler =
 							entries : []
 						};
 
-						for (var i = 0; i < batchEntries.length; i++) {
 							manifestContents.entries.push({
 								/*
 								 * fix url encoding for files with spaces. Space values come in
 								 * from Lambda with '+' and plus values come in as %2B. Redshift
 								 * wants the original S3 value
 								 */
-								url : 's3://' + r.s3.bucket.name + "/" +  batchEntries[i].replace('+', ' ').replace('%2B', '+'),
+								url : 's3://' + r.s3.bucket.name + "/" +  batchEntry.fullPath.replace('+', ' ').replace('%2B', '+'),
 								mandatory : true
 							});
-						}
 
 						var s3PutParams = {
 							Bucket : manifestInfo.manifestBucket,
@@ -596,7 +105,6 @@ exports.handler =
 						};
 
 						console.log("Writing manifest to " + manifestInfo.manifestBucket + "/" + manifestInfo.manifestPrefix);
-
 						/*
 						 * save the manifest file to S3 and build the rest of the copy
 						 * command in the callback letting us know that the manifest was
@@ -619,7 +127,6 @@ exports.handler =
 
 					// add the manifest file to the batch - this will NOT stop
 					// processing if it fails
-					exports.addManifestToBatch(config, thisBatchId, s3Info, manifestInfo);
 
 					// convert the config.loadClusters list into a format that
 					// looks like a native dynamo entry
@@ -647,8 +154,7 @@ exports.handler =
 
 						for (var i = 0; i < results.length; i++) {
 							if (!results[i] || results[i].status === ERROR) {
-								var allOK = false;
-								
+								allOK = false;
 								console.log("Cluster Load Failure " + results[i].error + " on Cluster " + results[i].cluster);
 							} 
 							// log the response state for each cluster
@@ -658,45 +164,13 @@ exports.handler =
 							};
 						}
 
-						var loadStateRequest = {
-							Key : {
-								batchId : {
-									S : thisBatchId
-								},
-								s3Prefix : {
-									S : s3Info.fullPath
-								}
-							},
-							TableName : batchTable,
-							AttributeUpdates : {
-								clusterLoadStatus : {
-									Action : 'PUT',
-									Value : {
-										S : JSON.stringify(loadState)
-									}
-								},
-								lastUpdate : {
-									Action : 'PUT',
-									Value : {
-										N : '' + common.now()
-									}
-								}
-							}
-						};
-						dynamoDB.updateItem(loadStateRequest, function(err, data) {
-							if (err) {
-								console.log("Error while attaching per-Cluster Load State");
-								exports.failBatch(err, config, thisBatchId, s3Info, manifestInfo);
-							} else {
-								if (allOK === true) {
-									// close the batch as OK
-									exports.closeBatch(null, config, thisBatchId, s3Info, manifestInfo, loadState);
-								} else {
-									// close the batch as failure
-									exports.failBatch(loadState, config, thisBatchId, s3Info, manifestInfo, loadState);
-								}
-							}
-						});
+						if (allOK === true) {
+							// close the batch as OK
+							context.done(null,null);
+						} else {
+							// close the batch as failure
+							exports.failBatch(loadState, config, thisBatchId, s3Info, manifestInfo, loadState);
+						}
 					});
 				}
 			};
@@ -769,9 +243,7 @@ exports.handler =
 								if (clusterInfo.clusterDB) {
 									dbString = dbString + '/' +  s3Info.prefix.split(path.sep)[1];
 								}
-								console
-										.log("Connecting to Database " + clusterInfo.clusterEndpoint.S + ":" + clusterInfo.clusterPort.N);
-								console.log("Connection String: " + dbString);
+								console.log("Connecting to Database " + clusterInfo.clusterEndpoint.S + ":" + clusterInfo.clusterPort.N);
 
 								/*
 								 * connect to database and run the copy command set
@@ -832,118 +304,15 @@ exports.handler =
 							s3.copyObject(copySpec, function(err, data) {
 								if (err) {
 									console.log(err);
-									exports.closeBatch(err, config, thisBatchId, s3Info, manifestInfo);
 								} else {
 									console.log('Created new Failed Manifest ' + manifestInfo.failedManifestPath);
-
-									// update the batch entry showing the failed
-									// manifest
-									// location
-									var manifestModification = {
-										Key : {
-											batchId : {
-												S : thisBatchId
-											},
-											s3Prefix : {
-												S : s3Info.prefix
-											}
-										},
-										TableName : batchTable,
-										AttributeUpdates : {
-											manifestFile : {
-												Action : 'PUT',
-												Value : {
-													S : manifestInfo.failedManifestPath
-												}
-											},
-											lastUpdate : {
-												Action : 'PUT',
-												Value : {
-													N : '' + common.now()
-												}
-											}
-										}
-									};
-									dynamoDB.updateItem(manifestModification, function(err, data) {
-										if (err) {
-											console.log(err);
-											exports.closeBatch(err, config, thisBatchId, s3Info, manifestInfo);
-										} else {
-											// close the batch with the original
-											// calling error
-											exports.closeBatch(loadState, config, thisBatchId, s3Info, manifestInfo);
-										}
-									});
 								}
 							});
 						} else {
 							console.log('Not requesting copy of Manifest to Failed S3 Location');
-							exports.closeBatch(loadState, config, thisBatchId, s3Info, manifestInfo);
 						}
 					};
 
-			/**
-			 * Function which closes the batch to mark it as done, including
-			 * notifications
-			 */
-			exports.closeBatch = function(batchError, config, thisBatchId, s3Info, manifestInfo) {
-				var batchEndStatus;
-
-				if (batchError && batchError !== null) {
-					batchEndStatus = error;
-				} else {
-					batchEndStatus = complete;
-				}
-
-				var item = {
-					Key : {
-						batchId : {
-							S : thisBatchId
-						},
-						s3Prefix : {
-							S : s3Info.fullPath
-						}
-					},
-					TableName : batchTable,
-					AttributeUpdates : {
-						status : {
-							Action : 'PUT',
-							Value : {
-								S : batchEndStatus
-							}
-						},
-						lastUpdate : {
-							Action : 'PUT',
-							Value : {
-								N : '' + common.now()
-							}
-						}
-					}
-				};
-
-				// add the error message to the updates if we had one
-				if (batchError && batchError !== null) {
-					item.AttributeUpdates.errorMessage = {
-						Action : 'PUT',
-						Value : {
-							S : JSON.stringify(batchError)
-						}
-					};
-				}
-
-				// mark the batch as closed
-				dynamoDB.updateItem(item, function(err, data) {
-					// ugh, the batch closure didn't finish - this is not a good
-					// place to be
-					if (err) {
-						console.log(err);
-						context.done(error, err);
-					} else {
-						// send notifications
-						exports.notify(config, thisBatchId, s3Info, manifestInfo, batchError);
-					}
-				});
-			};
 
 			/** send an SNS message to a topic */
 			exports.sendSNS = function(topic, subj, msg, successCallback, failureCallback) {
@@ -1111,7 +480,6 @@ exports.handler =
 								return !proceed && tryNumber < lookupConfigTries;
 							}, function(callback) {
 								tryNumber++;
-
 								// lookup the configuration item, and run
 								// foundConfig on completion
 								dynamoDB.getItem(dynamoLookup, function(err, data) {
@@ -1138,6 +506,7 @@ exports.handler =
 									// fail the context as we haven't been able to
 									// lookup the onfiguration
 									console.log(err);
+
 									context.done(error, err);
 								} else {
 									// call the foundConfig method with the data item
